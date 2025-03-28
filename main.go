@@ -571,3 +571,5 @@ func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
 		log.Printf("Ошибка отправки меню: %v", err)
 	}
 }
+
+git allo
