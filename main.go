@@ -10,13 +10,16 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// Структуры для хранения данных
 var (
-	activeChats   = make(map[int64]int64) // userID -> adminID
-	subscribers   = make(map[int64]bool)
-	mutex         sync.Mutex
+	subscribers = make(map[int64]bool) // Подписчики на рассылку
+	activeChats = make(map[int64]bool) // Активные чаты с менеджером
+	chatPairs   = make(map[int64]int64) // Связь пользователь-админ
+	mutex       sync.Mutex              // Для потокобезопасности
 )
 
 func main() {
+	// Получаем токен бота и ID администратора
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_ID"), 10, 64)
 
@@ -24,6 +27,7 @@ func main() {
 		log.Fatal("Требуются TELEGRAM_BOT_TOKEN и ADMIN_ID")
 	}
 
+	// Инициализация бота
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Fatal(err)
@@ -32,6 +36,7 @@ func main() {
 	bot.Debug = true
 	log.Printf("Бот запущен: @%s", bot.Self.UserName)
 
+	// Настройка обработки сообщений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
@@ -48,45 +53,35 @@ func main() {
 func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, adminID int64) {
 	chatID := msg.Chat.ID
 
-	// Сообщения от админа
+	// Обработка сообщений от администратора
 	if chatID == adminID {
+		// Рассылка подписчикам
 		if msg.Photo != nil || msg.Document != nil {
-			sendStockToSubscribers(bot, msg)
+			sendToSubscribers(bot, msg)
 			return
 		}
-		handleAdminMessage(bot, msg)
+		// Ответ пользователю
+		handleAdminReply(bot, msg)
 		return
 	}
 
-	// Сообщения от пользователей
+	// Проверка активного чата
 	mutex.Lock()
-	_, isActive := activeChats[chatID]
+	isActive := activeChats[chatID]
 	mutex.Unlock()
 
+	// Если чат активен - пересылаем сообщение админу
 	if isActive {
 		forwardToAdmin(bot, chatID, msg.MessageID, adminID)
 		return
 	}
 
-	// Открываем меню при любом сообщении, если чат не активен
-	sendMainMenu(bot, chatID)
-}
-
-func handleAdminMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.ForwardFrom != nil {
-		// Ответ на пересланное сообщение
-		userID := msg.ReplyToMessage.ForwardFrom.ID
-		sendToUser(bot, userID, "👨‍💼 Ответ менеджера:\n"+msg.Text)
-	} else {
-		// Прямое сообщение (отправим последнему чату)
-		mutex.Lock()
-		for userID, admID := range activeChats {
-			if admID == msg.Chat.ID {
-				sendToUser(bot, userID, "👨‍💼 Сообщение менеджера:\n"+msg.Text)
-				break
-			}
-		}
-		mutex.Unlock()
+	// Обработка команд пользователя
+	switch msg.Text {
+	case "/start":
+		sendMainMenu(bot, chatID)
+	default:
+		sendMainMenu(bot, chatID)
 	}
 }
 
@@ -94,93 +89,128 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 	chatID := query.Message.Chat.ID
 	data := query.Data
 
-	// Удаляем "часики" на кнопке
+	// Убираем "часики" на кнопке
 	bot.Send(tgbotapi.NewCallback(query.ID, ""))
 
 	switch data {
-	case "subscribe_news":
+	case "subscribe":
 		mutex.Lock()
 		subscribers[chatID] = true
 		mutex.Unlock()
-		bot.Send(tgbotapi.NewMessage(chatID, "✅ Вы подписались на рассылку новостей"))
-		sendMainMenu(bot, chatID)
-
-	case "unsubscribe_news":
-		mutex.Lock()
-		delete(subscribers, chatID)
-		mutex.Unlock()
-		bot.Send(tgbotapi.NewMessage(chatID, "❌ Вы отписались от рассылки новостей"))
+		
+		// Получаем информацию о пользователе
+		user := query.From
+		userName := getUserName(user)
+		
+		// Уведомление пользователю
+		msg := tgbotapi.NewMessage(chatID, "✅ Вы подписались на рассылку поступлений")
+		bot.Send(msg)
+		
+		// Уведомление админу о новом подписчике
+		adminMsg := tgbotapi.NewMessage(
+			adminID,
+			fmt.Sprintf("🎉 Новый подписчик:\nID: %d\nUsername: @%s\nИмя: %s",
+				user.ID,
+				getUserUsername(user),
+				userName,
+			),
+		)
+		bot.Send(adminMsg)
+		
 		sendMainMenu(bot, chatID)
 
 	case "contact_manager":
 		mutex.Lock()
-		activeChats[chatID] = adminID
+		activeChats[chatID] = true
+		chatPairs[chatID] = adminID
 		mutex.Unlock()
-		bot.Send(tgbotapi.NewMessage(chatID, "📩 Чат с менеджером открыт. Напишите ваш вопрос."))
-		bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("🔔 Новый чат с пользователем %d", chatID)))
 
-	case "end_chat":
-		endChatSession(bot, chatID, adminID)
+		// Уведомление пользователю
+		msg := tgbotapi.NewMessage(chatID, "📩 Теперь вы можете писать менеджеру. Отправьте ваше сообщение.")
+		bot.Send(msg)
+		
+		// Получаем информацию о пользователе
+		user := query.From
+		userName := getUserName(user)
+		
+		// Уведомление админу
+		adminMsg := tgbotapi.NewMessage(
+			adminID, 
+			fmt.Sprintf("❗ Новый чат:\nID: %d\nUsername: @%s\nИмя: %s",
+				user.ID,
+				getUserUsername(user),
+				userName,
+			),
+		)
+		bot.Send(adminMsg)
 
-	case "open_menu":
-		sendMainMenu(bot, chatID)
+	case "close":
+		msg := tgbotapi.NewMessage(chatID, "Меню закрыто. Для открытия напишите /start")
+		bot.Send(msg)
 	}
 }
 
+// Вспомогательные функции для получения информации о пользователе
+func getUserName(user *tgbotapi.User) string {
+	name := user.FirstName
+	if user.LastName != "" {
+		name += " " + user.LastName
+	}
+	if name == "" {
+		name = "Не указано"
+	}
+	return name
+}
+
+func getUserUsername(user *tgbotapi.User) string {
+	if user.UserName == "" {
+		return "нет username"
+	}
+	return user.UserName
+}
+
 func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
+	// Проверяем статус подписки
 	mutex.Lock()
 	isSubscribed := subscribers[chatID]
-	_, isActiveChat := activeChats[chatID]
 	mutex.Unlock()
 
-	// Основные кнопки меню
-	var rows [][]tgbotapi.InlineKeyboardButton
-
-	// Кнопки подписки/отписки
+	// Текст кнопки подписки
+	subscribeBtn := tgbotapi.NewInlineKeyboardButtonData("📩 Подписаться на рассылку поступлений", "subscribe")
 	if isSubscribed {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🚫 Отписаться от новостей", "unsubscribe_news"),
-		))
-	} else {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📰 Подписаться на новости", "subscribe_news"),
-		))
+		subscribeBtn = tgbotapi.NewInlineKeyboardButtonData("✅ Вы подписаны на рассылку", "subscribe")
 	}
 
-	// Кнопка чата с менеджером
-	if isActiveChat {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔚 Завершить чат", "end_chat"),
-		))
-	} else {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("👨‍💼 Чат с менеджером", "contact_manager"),
-		))
-	}
+	// Создаем меню с тремя кнопками
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			subscribeBtn,
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👨‍💼 Написать менеджеру", "contact_manager"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Закрыть", "close"),
+		),
+	)
 
-	// Кнопка обновления меню
-	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🔄 Обновить меню", "open_menu"),
-	))
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
-
-	msg := tgbotapi.NewMessage(chatID, "📋 *Главное меню*")
+	msg := tgbotapi.NewMessage(chatID, "🔷 *Главное меню* 🔷\nВыберите действие:")
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = keyboard
 	bot.Send(msg)
 }
 
-func sendStockToSubscribers(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+func sendToSubscribers(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
 	if len(subscribers) == 0 {
-		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Нет подписчиков для рассылки"))
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Нет подписчиков для рассылки"))
 		return
 	}
 
-	caption := "🛒 *Актуальные остатки на складе:*\n"
+	// Стандартный текст рассылки
+	caption := "Добрый день! У нас новое поступление. Ознакомьтесь с обновлением!"
 	if msg.Caption != "" {
 		caption = msg.Caption
 	}
@@ -190,15 +220,15 @@ func sendStockToSubscribers(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		var err error
 		
 		if len(msg.Photo) > 0 {
+			// Отправка фото
 			photo := msg.Photo[len(msg.Photo)-1]
 			photoMsg := tgbotapi.NewPhoto(userID, tgbotapi.FileID(photo.FileID))
 			photoMsg.Caption = caption
-			photoMsg.ParseMode = "Markdown"
 			_, err = bot.Send(photoMsg)
 		} else if msg.Document != nil {
+			// Отправка документа
 			docMsg := tgbotapi.NewDocument(userID, tgbotapi.FileID(msg.Document.FileID))
 			docMsg.Caption = caption
-			docMsg.ParseMode = "Markdown"
 			_, err = bot.Send(docMsg)
 		}
 
@@ -209,33 +239,38 @@ func sendStockToSubscribers(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 	}
 
-	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Рассылка отправлена %d подписчикам", successCount)))
+	// Отчет администратору
+	report := fmt.Sprintf("Рассылка отправлена %d подписчикам", successCount)
+	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, report))
 }
 
-func sendToUser(bot *tgbotapi.BotAPI, userID int64, text string) {
-	msg := tgbotapi.NewMessage(userID, text)
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("Ошибка отправки пользователю %d: %v", userID, err)
+func handleAdminReply(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	// Ответ на пересланное сообщение
+	if msg.ReplyToMessage != nil && msg.ReplyToMessage.ForwardFrom != nil {
+		userID := msg.ReplyToMessage.ForwardFrom.ID
+		reply := tgbotapi.NewMessage(userID, "👨‍💼 Ответ менеджера:\n"+msg.Text)
+		bot.Send(reply)
+		return
+	}
+
+	// Прямой ответ через сохраненные сессии
+	mutex.Lock()
+	defer mutex.Unlock()
+	
+	for userID, adminID := range chatPairs {
+		if adminID == msg.Chat.ID {
+			reply := tgbotapi.NewMessage(userID, "👨‍💼 Сообщение менеджера:\n"+msg.Text)
+			bot.Send(reply)
+			break
+		}
 	}
 }
 
 func forwardToAdmin(bot *tgbotapi.BotAPI, chatID int64, messageID int, adminID int64) {
 	mutex.Lock()
-	activeChats[chatID] = adminID
+	chatPairs[chatID] = adminID
 	mutex.Unlock()
 
 	forward := tgbotapi.NewForward(adminID, chatID, messageID)
-	if _, err := bot.Send(forward); err != nil {
-		log.Printf("Ошибка пересылки: %v", err)
-	}
-}
-
-func endChatSession(bot *tgbotapi.BotAPI, chatID int64, adminID int64) {
-	mutex.Lock()
-	delete(activeChats, chatID)
-	mutex.Unlock()
-
-	bot.Send(tgbotapi.NewMessage(chatID, "🗣 Чат с менеджером завершен"))
-	bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("🔕 Пользователь %d завершил чат", chatID)))
-	sendMainMenu(bot, chatID)
+	bot.Send(forward)
 }
