@@ -10,15 +10,10 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-type ChatSession struct {
-	UserID  int64
-	AdminID int64
-}
-
 var (
-	activeSessions = make(map[int64]ChatSession) // userID -> session
-	subscribers    = make(map[int64]bool)
-	mutex          sync.Mutex
+	activeChats   = make(map[int64]int64) // userID -> adminID
+	subscribers   = make(map[int64]bool)
+	mutex         sync.Mutex
 )
 
 func main() {
@@ -34,6 +29,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	bot.Debug = true
 	log.Printf("Бот запущен: @%s", bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
@@ -52,32 +48,38 @@ func main() {
 func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, adminID int64) {
 	chatID := msg.Chat.ID
 
-	// Ответы админа
+	// Сообщения от админа
 	if chatID == adminID {
-		if msg.Photo != nil || msg.Document != nil {
-			broadcastToSubscribers(bot, msg)
-			return
+		if msg.ReplyToMessage != nil && msg.ReplyToMessage.ForwardFrom != nil {
+			// Ответ на пересланное сообщение
+			userID := msg.ReplyToMessage.ForwardFrom.ID
+			sendToUser(bot, userID, "👨‍💼 Ответ менеджера:\n"+msg.Text)
+		} else {
+			// Прямое сообщение (отправим последнему чату)
+			mutex.Lock()
+			for userID, admID := range activeChats {
+				if admID == adminID {
+					sendToUser(bot, userID, "👨‍💼 Сообщение менеджера:\n"+msg.Text)
+					break
+				}
+			}
+			mutex.Unlock()
 		}
-		handleAdminMessage(bot, msg)
 		return
 	}
 
-	// Проверка активного чата
+	// Сообщения от пользователей
 	mutex.Lock()
-	session, exists := activeSessions[chatID]
+	_, isActive := activeChats[chatID]
 	mutex.Unlock()
 
-	if msg.Text == "/stop" && exists {
-		endChatSession(bot, session)
+	if msg.Text == "/stop" && isActive {
+		endChatSession(bot, chatID, adminID)
 		return
 	}
 
-	if exists {
-		if msg.Text == "/start" {
-			sendMainMenu(bot, chatID)
-			return
-		}
-		forwardToAdmin(bot, msg, session.AdminID)
+	if isActive {
+		forwardToAdmin(bot, chatID, msg.MessageID, adminID)
 		return
 	}
 
@@ -85,7 +87,8 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, adminID int64) {
 	case "/start":
 		sendMainMenu(bot, chatID)
 	default:
-		bot.Send(tgbotapi.NewMessage(chatID, "Используйте кнопки меню (/start)"))
+		msg := tgbotapi.NewMessage(chatID, "ℹ️ Пожалуйста, используйте кнопки меню (/start)")
+		bot.Send(msg)
 	}
 }
 
@@ -93,6 +96,7 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 	chatID := query.Message.Chat.ID
 	data := query.Data
 
+	// Удаляем "часики" на кнопке
 	bot.Send(tgbotapi.NewCallback(query.ID, ""))
 
 	switch data {
@@ -112,33 +116,14 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 
 	case "contact_manager":
 		mutex.Lock()
-		activeSessions[chatID] = ChatSession{
-			UserID:  chatID,
-			AdminID: adminID,
-		}
+		activeChats[chatID] = adminID
 		mutex.Unlock()
-		bot.Send(tgbotapi.NewMessage(chatID, "💬 Чат с менеджером открыт. Напишите ваш вопрос."))
-		bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("Новый чат с пользователем %d", chatID)))
+		bot.Send(tgbotapi.NewMessage(chatID, "📩 Теперь вы можете писать менеджеру. Отправьте ваше сообщение.\n\nЧтобы завершить диалог, отправьте /stop"))
+		bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("🔔 Новый чат с пользователем %d", chatID)))
 
-	case "end_chat":
-		mutex.Lock()
-		session := activeSessions[chatID]
-		mutex.Unlock()
-		endChatSession(bot, session)
-
-	case "close":
-		bot.Send(tgbotapi.NewMessage(chatID, "Меню закрыто. Используйте /start для открытия"))
+	case "close_menu":
+		bot.Send(tgbotapi.NewMessage(chatID, "Меню закрыто. Для открытия отправьте /start"))
 	}
-}
-
-func endChatSession(bot *tgbotapi.BotAPI, session ChatSession) {
-	mutex.Lock()
-	delete(activeSessions, session.UserID)
-	mutex.Unlock()
-
-	bot.Send(tgbotapi.NewMessage(session.UserID, "🗣 Чат с менеджером завершен"))
-	bot.Send(tgbotapi.NewMessage(session.AdminID, fmt.Sprintf("Чат с %d завершен", session.UserID)))
-	sendMainMenu(bot, session.UserID)
 }
 
 func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
@@ -146,95 +131,52 @@ func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
 	isSubscribed := subscribers[chatID]
 	mutex.Unlock()
 
-	var subscribeBtn tgbotapi.InlineKeyboardButton
+	// Улучшенные кнопки с эмодзи и четкими названиями
+	subscribeBtn := tgbotapi.NewInlineKeyboardButtonData("🔔 Подписаться на новости", "subscribe")
 	if isSubscribed {
-		subscribeBtn = tgbotapi.NewInlineKeyboardButtonData("❌ Отписаться от обновлений", "unsubscribe")
-	} else {
-		subscribeBtn = tgbotapi.NewInlineKeyboardButtonData("📩 Подписаться на обновления", "subscribe")
+		subscribeBtn = tgbotapi.NewInlineKeyboardButtonData("🔕 Отписаться от новостей", "unsubscribe")
 	}
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(subscribeBtn),
 		tgbotapi.NewInlineKeyboardRow(
-			subscribeBtn,
+			tgbotapi.NewInlineKeyboardButtonData("💬 Чат с менеджером", "contact_manager"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("💬 Написать менеджеру", "contact_manager"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🚪 Закрыть меню", "close"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Закрыть меню", "close_menu"),
 		),
 	)
 
-	msg := tgbotapi.NewMessage(chatID, "📱 Главное меню бота\n\nВыберите действие:")
+	msg := tgbotapi.NewMessage(chatID, "📱 *Главное меню*")
+	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = keyboard
 	bot.Send(msg)
 }
 
-func handleAdminMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.ForwardFrom != nil {
-		userID := msg.ReplyToMessage.ForwardFrom.ID
-		sendToUser(bot, userID, msg.Text)
-		return
-	}
-
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	for userID, session := range activeSessions {
-		if session.AdminID == msg.Chat.ID {
-			sendToUser(bot, userID, msg.Text)
-			break
-		}
-	}
-}
-
 func sendToUser(bot *tgbotapi.BotAPI, userID int64, text string) {
-	msg := tgbotapi.NewMessage(userID, "👨‍💼 Ответ менеджера:\n"+text)
+	msg := tgbotapi.NewMessage(userID, text)
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("Ошибка отправки пользователю %d: %v", userID, err)
 	}
 }
 
-func forwardToAdmin(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, adminID int64) {
+func forwardToAdmin(bot *tgbotapi.BotAPI, chatID int64, messageID int, adminID int64) {
 	mutex.Lock()
-	if _, exists := activeSessions[msg.Chat.ID]; !exists {
-		activeSessions[msg.Chat.ID] = ChatSession{
-			UserID:  msg.Chat.ID,
-			AdminID: adminID,
-		}
-	}
+	activeChats[chatID] = adminID
 	mutex.Unlock()
 
-	forward := tgbotapi.NewForward(adminID, msg.Chat.ID, msg.MessageID)
+	forward := tgbotapi.NewForward(adminID, chatID, messageID)
 	if _, err := bot.Send(forward); err != nil {
 		log.Printf("Ошибка пересылки: %v", err)
 	}
 }
 
-func broadcastToSubscribers(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+func endChatSession(bot *tgbotapi.BotAPI, chatID int64, adminID int64) {
 	mutex.Lock()
-	defer mutex.Unlock()
+	delete(activeChats, chatID)
+	mutex.Unlock()
 
-	if len(subscribers) == 0 {
-		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Нет подписчиков для рассылки"))
-		return
-	}
-
-	caption := "Добрый день! Новое поступление на склад:"
-	if msg.Caption != "" {
-		caption = msg.Caption
-	}
-
-	for userID := range subscribers {
-		if len(msg.Photo) > 0 {
-			photo := msg.Photo[len(msg.Photo)-1]
-			photoMsg := tgbotapi.NewPhoto(userID, tgbotapi.FileID(photo.FileID))
-			photoMsg.Caption = caption
-			bot.Send(photoMsg)
-		} else if msg.Document != nil {
-			docMsg := tgbotapi.NewDocument(userID, tgbotapi.FileID(msg.Document.FileID))
-			docMsg.Caption = caption
-			bot.Send(docMsg)
-		}
-	}
+	bot.Send(tgbotapi.NewMessage(chatID, "🗣 Чат с менеджером завершен. Для нового диалога используйте меню (/start)"))
+	bot.Send(tgbotapi.NewMessage(adminID, fmt.Sprintf("🔕 Чат с пользователем %d завершен", chatID)))
+	
 }
