@@ -5,7 +5,9 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -25,9 +27,24 @@ var (
 
 	subscribers = struct {
 		sync.Mutex
-		users map[int64]bool
-	}{users: make(map[int64]bool)}
+		users map[int64]SubscriberInfo
+	}{users: make(map[int64]SubscriberInfo)}
+
+	mailingStatus = struct {
+		sync.Mutex
+		active bool
+	}{active: true}
+
+	mediaGroups = struct {
+		sync.Mutex
+		groups map[string][]tgbotapi.Message
+	}{groups: make(map[string][]tgbotapi.Message)}
 )
+
+type SubscriberInfo struct {
+	Username string
+	FullName string
+}
 
 func main() {
 	// Загрузка конфигурации
@@ -57,6 +74,14 @@ func main() {
 
 	log.Printf("Бот @%s запущен", bot.Self.UserName)
 
+	// Очистка старых медиагрупп каждые 10 минут
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			cleanOldMediaGroups()
+		}
+	}()
+
 	// Настройка обновлений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -72,14 +97,38 @@ func main() {
 	}
 }
 
+func cleanOldMediaGroups() {
+	mediaGroups.Lock()
+	defer mediaGroups.Unlock()
+
+	for groupID, messages := range mediaGroups.groups {
+		if len(messages) > 0 {
+			// Удаляем группы старше 1 часа
+			if time.Since(messages[0].Time()).Hours() > 1 {
+				delete(mediaGroups.groups, groupID)
+			}
+		}
+	}
+}
+
 func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, adminID int64) {
 	chatID := message.Chat.ID
 
 	// Обработка сообщений от администратора
 	if chatID == adminID {
+		// Команда для просмотра подписчиков
+		if message.Text == "/subscribers" {
+			sendSubscribersList(bot, adminID)
+			return
+		}
+		// Команда для управления рассылкой
+		if message.Text == "/toggle_mailing" {
+			toggleMailingStatus(bot, adminID)
+			return
+		}
 		// Рассылка контента подписчикам
-		if message.Photo != nil || message.Document != nil {
-			sendToSubscribers(bot, message, adminID)
+		if (len(message.Photo) > 0 || message.Document != nil || message.MediaGroupID != "") && isMailingActive() {
+			handleAdminMedia(bot, message, adminID)
 			return
 		}
 		handleAdminMessage(bot, message)
@@ -129,7 +178,172 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, adminID int6
 	}
 }
 
-// Рассылка контента подписчикам
+func handleAdminMedia(bot *tgbotapi.BotAPI, message *tgbotapi.Message, adminID int64) {
+	// Если это медиагруппа
+	if message.MediaGroupID != "" {
+		mediaGroups.Lock()
+		defer mediaGroups.Unlock()
+
+		// Добавляем сообщение в группу
+		mediaGroups.groups[message.MediaGroupID] = append(mediaGroups.groups[message.MediaGroupID], *message)
+
+		// Проверяем, собраны ли все сообщения группы (эвристика - ждем 1 секунду)
+		time.AfterFunc(1*time.Second, func() {
+			mediaGroups.Lock()
+			defer mediaGroups.Unlock()
+
+			if messages, ok := mediaGroups.groups[message.MediaGroupID]; ok {
+				// Проверяем, что это последнее сообщение в группе
+				if len(messages) > 1 && isLastMediaGroupMessage(messages) {
+					sendMediaGroupToSubscribers(bot, messages, adminID)
+					delete(mediaGroups.groups, message.MediaGroupID)
+				}
+			}
+		})
+	} else {
+		// Одиночное медиа
+		sendToSubscribers(bot, message, adminID)
+	}
+}
+
+func isLastMediaGroupMessage(messages []tgbotapi.Message) bool {
+	// Простая проверка - если прошло больше 0.5 секунд с последнего сообщения
+	if len(messages) == 0 {
+		return false
+	}
+	lastTime := messages[len(messages)-1].Time()
+	return time.Since(lastTime).Seconds() > 0.5
+}
+
+func sendMediaGroupToSubscribers(bot *tgbotapi.BotAPI, messages []tgbotapi.Message, adminID int64) {
+	subscribers.Lock()
+	defer subscribers.Unlock()
+
+	if len(subscribers.users) == 0 {
+		msg := tgbotapi.NewMessage(adminID, "Нет подписчиков для рассылки")
+		bot.Send(msg)
+		return
+	}
+
+	// Получаем подпись из первого сообщения с медиа
+	caption := ""
+	for _, msg := range messages {
+		if msg.Caption != "" {
+			caption = msg.Caption
+			break
+		}
+	}
+	if caption == "" {
+		caption = "Добрый день! У нас новое поступление. Ознакомьтесь с обновлением!"
+	}
+
+	successCount := 0
+	failCount := 0
+
+	// Создаем медиагруппу для каждого подписчика
+	for userID := range subscribers.users {
+		mediaGroup := make([]interface{}, 0, len(messages))
+		
+		for i, msg := range messages {
+			if len(msg.Photo) > 0 {
+				photo := msg.Photo[len(msg.Photo)-1]
+				inputMedia := tgbotapi.NewInputMediaPhoto(tgbotapi.FileID(photo.FileID))
+				if i == 0 {
+					inputMedia.Caption = caption
+				}
+				mediaGroup = append(mediaGroup, inputMedia)
+			} else if msg.Document != nil {
+				inputMedia := tgbotapi.NewInputMediaDocument(tgbotapi.FileID(msg.Document.FileID))
+				if i == 0 {
+					inputMedia.Caption = caption
+				}
+				mediaGroup = append(mediaGroup, inputMedia)
+			}
+		}
+
+		if len(mediaGroup) > 0 {
+			album := tgbotapi.NewMediaGroup(userID, mediaGroup)
+			if _, err := bot.Send(album); err != nil {
+				log.Printf("Ошибка отправки медиагруппы для %d: %v", userID, err)
+				failCount++
+				
+				// Удаляем заблокировавших бота пользователей
+				if err.Error() == "Forbidden: bot was blocked by the user" {
+					delete(subscribers.users, userID)
+				}
+			} else {
+				successCount++
+			}
+		}
+	}
+
+	// Отчет администратору
+	report := fmt.Sprintf("Рассылка медиагруппы завершена:\nСообщений в группе: %d\nУспешно: %d\nНе удалось: %d", 
+		len(messages), successCount, failCount)
+	if failCount > 0 {
+		report += "\n\nПримечание: Заблокировавшие бота пользователи удалены из подписчиков"
+	}
+	if _, err := bot.Send(tgbotapi.NewMessage(adminID, report)); err != nil {
+		log.Printf("Ошибка отправки отчета: %v", err)
+	}
+}
+
+func sendSubscribersList(bot *tgbotapi.BotAPI, adminID int64) {
+	subscribers.Lock()
+	defer subscribers.Unlock()
+
+	if len(subscribers.users) == 0 {
+		msg := tgbotapi.NewMessage(adminID, "Нет подписчиков")
+		bot.Send(msg)
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📊 Всего подписчиков: %d\n\n", len(subscribers.users)))
+
+	for id, info := range subscribers.users {
+		sb.WriteString(fmt.Sprintf("🆔 ID: %d\n👤 Имя: %s\n📛 Юзернейм: @%s\n\n", 
+			id, info.FullName, info.Username))
+	}
+
+	msg := tgbotapi.NewMessage(adminID, sb.String())
+	msg.ParseMode = "HTML"
+	bot.Send(msg)
+}
+
+func notifyNewSubscriber(bot *tgbotapi.BotAPI, adminID int64, userID int64, username string, fullName string) {
+	msgText := fmt.Sprintf("🎉 Новый подписчик!\n\nID: %d\nИмя: %s\nЮзернейм: @%s", 
+		userID, fullName, username)
+	
+	msg := tgbotapi.NewMessage(adminID, msgText)
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("Ошибка отправки уведомления о новом подписчике: %v", err)
+	}
+}
+
+func toggleMailingStatus(bot *tgbotapi.BotAPI, adminID int64) {
+	mailingStatus.Lock()
+	mailingStatus.active = !mailingStatus.active
+	status := mailingStatus.active
+	mailingStatus.Unlock()
+
+	var text string
+	if status {
+		text = "✅ Рассылка активирована"
+	} else {
+		text = "❌ Рассылка приостановлена"
+	}
+
+	msg := tgbotapi.NewMessage(adminID, text)
+	bot.Send(msg)
+}
+
+func isMailingActive() bool {
+	mailingStatus.Lock()
+	defer mailingStatus.Unlock()
+	return mailingStatus.active
+}
+
 func sendToSubscribers(bot *tgbotapi.BotAPI, message *tgbotapi.Message, adminID int64) {
 	subscribers.Lock()
 	defer subscribers.Unlock()
@@ -188,7 +402,6 @@ func sendToSubscribers(bot *tgbotapi.BotAPI, message *tgbotapi.Message, adminID 
 	}
 }
 
-// Завершение диалога с менеджером
 func endChatWithManager(bot *tgbotapi.BotAPI, userID, adminID int64) {
 	activeChats.Lock()
 	delete(activeChats.users, userID)
@@ -211,7 +424,6 @@ func endChatWithManager(bot *tgbotapi.BotAPI, userID, adminID int64) {
 	sendMainMenu(bot, userID)
 }
 
-// Обработка сообщений от администратора
 func handleAdminMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	// Ответ на пересланное сообщение
 	if message.ReplyToMessage != nil && message.ReplyToMessage.ForwardFrom != nil {
@@ -238,7 +450,6 @@ func handleAdminMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	}
 }
 
-// Обработка нажатий кнопок
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID int64) {
 	chatID := query.Message.Chat.ID
 	data := query.Data
@@ -251,13 +462,29 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 	switch data {
 	case "subscribe":
 		subscribers.Lock()
-		subscribers.users[chatID] = true
+		// Проверяем, новый ли это подписчик
+		isNewSubscriber := false
+		if _, exists := subscribers.users[chatID]; !exists {
+			isNewSubscriber = true
+		}
+		
+		subscribers.users[chatID] = SubscriberInfo{
+			Username: query.From.UserName,
+			FullName: query.From.FirstName + " " + query.From.LastName,
+		}
 		subscribers.Unlock()
 		
 		msg := tgbotapi.NewMessage(chatID, "✅ Вы успешно подписались на рассылку!")
 		if _, err := bot.Send(msg); err != nil {
 			log.Printf("Ошибка отправки: %v", err)
 		}
+		
+		// Уведомляем админа о новом подписчике
+		if isNewSubscriber {
+			notifyNewSubscriber(bot, adminID, chatID, query.From.UserName, 
+				query.From.FirstName+" "+query.From.LastName)
+		}
+		
 		sendMainMenu(bot, chatID)
 
 	case "unsubscribe":
@@ -291,7 +518,8 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 			log.Printf("Ошибка отправки: %v", err)
 		}
 
-		adminMsg := tgbotapi.NewMessage(adminID, fmt.Sprintf("❗ Чат с пользователем %d", chatID))
+		adminMsg := tgbotapi.NewMessage(adminID, fmt.Sprintf("❗ Чат с пользователем %d (@%s - %s)", 
+			chatID, query.From.UserName, query.From.FirstName+" "+query.From.LastName))
 		if _, err := bot.Send(adminMsg); err != nil {
 			log.Printf("Ошибка отправки: %v", err)
 		}
@@ -307,11 +535,10 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, adminID
 	}
 }
 
-// Отправка главного меню
 func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64) {
 	// Проверка статуса подписки
 	subscribers.Lock()
-	isSubscribed := subscribers.users[chatID]
+	_, isSubscribed := subscribers.users[chatID]
 	subscribers.Unlock()
 
 	// Текст кнопки подписки
