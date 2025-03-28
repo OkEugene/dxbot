@@ -154,10 +154,7 @@ func sendStockUpdate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	caption := "🛒 *Актуальные остатки на складе:*\n"
-	if msg.Caption != "" {
-		caption = msg.Caption
-	}
+	caption := "Добрый день! У нас новое поступление. Ознакомьтесь с обновлением!"
 
 	successCount := 0
 	for userID := range subscribers {
@@ -167,12 +164,10 @@ func sendStockUpdate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			photo := msg.Photo[len(msg.Photo)-1]
 			photoMsg := tgbotapi.NewPhoto(userID, tgbotapi.FileID(photo.FileID))
 			photoMsg.Caption = caption
-			photoMsg.ParseMode = "Markdown"
 			_, err = bot.Send(photoMsg)
 		} else if msg.Document != nil {
 			docMsg := tgbotapi.NewDocument(userID, tgbotapi.FileID(msg.Document.FileID))
 			docMsg.Caption = caption
-			docMsg.ParseMode = "Markdown"
 			_, err = bot.Send(docMsg)
 		}
 
